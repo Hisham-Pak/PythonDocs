@@ -1,4 +1,4 @@
-package com.pythondocs
+package com.thehisham.pythondocs
 
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
