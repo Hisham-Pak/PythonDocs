@@ -1,0 +1,238 @@
+name: Build Offline Python Docs
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip jq curl
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build docs zips + manifest.json
+        env:
+          OUT_DIR: out
+        run: |
+          set -euo pipefail
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
+
+          REPO_URL="https://github.com/python/cpython.git"
+
+          echo "Discovering CPython tags..." >&2
+          TAGS=$(git ls-remote --tags "$REPO_URL" \
+            | awk '{print $2}' \
+            | sed 's#refs/tags/##' \
+            | sed 's#\^{}##' \
+            | grep -E '^v(2\.6|2\.7|3\.)[0-9]+\.[0-9]+$' \
+            | sed 's/^v//' \
+            | sort -V)
+
+          # Unique series X.Y, filter >= 2.6
+          SERIES=$(echo "$TAGS" \
+            | awk -F. '{print $1"."$2}' \
+            | sort -Vu \
+            | awk -F. '($1>2)||($1==2&&$2>=6){print $0}')
+
+          echo "Series to process (>=2.6):" >&2
+          echo "$SERIES" >&2
+
+          # Stable Python 3 series = max 3.Y in SERIES
+          STABLE_3_SERIES="$(echo "$SERIES" | awk -F. '$1==3{print $0}' | tail -n 1)"
+          if [ -z "${STABLE_3_SERIES:-}" ]; then
+            echo "No Python 3 series found; aborting." >&2
+            exit 1
+          fi
+
+          STABLE_MAJ="${STABLE_3_SERIES%%.*}"
+          STABLE_MIN="${STABLE_3_SERIES#*.}"
+          INFERRED_DEV_SERIES="${STABLE_MAJ}.$((STABLE_MIN + 1))"
+
+          echo "Stable 3.x series: $STABLE_3_SERIES" >&2
+          echo "Inferred dev series: $INFERRED_DEV_SERIES" >&2
+
+          META="$OUT_DIR/meta.txt"
+          : > "$META"
+
+          sha_for_tag () {
+            local TAG_NO_V="$1"
+            local TAG="v${TAG_NO_V}"
+            local SHA
+            SHA=$(git ls-remote "$REPO_URL" "refs/tags/${TAG}^{}" | awk '{print $1}' || true)
+            if [ -z "${SHA:-}" ]; then
+              SHA=$(git ls-remote "$REPO_URL" "refs/tags/${TAG}" | awk '{print $1}' || true)
+            fi
+            echo "${SHA:-}"
+          }
+
+          sha_for_branch () {
+            local BR="$1"
+            git ls-remote "$REPO_URL" "refs/heads/${BR}" | awk '{print $1}' || true
+          }
+
+          latest_patch_for_series () {
+            local SERIES="$1" # e.g. 3.12
+            echo "$TAGS" | grep -E "^${SERIES}\.[0-9]+$" | tail -n 1 || true
+          }
+
+          download_to () {
+            local URL="$1"
+            local OUT="$2"
+            echo "Downloading: $URL" >&2
+            curl -fL "$URL" -o "$OUT"
+          }
+
+          download_docs_zip () {
+            local SLUG="$1"         # "dev" | "3" | "3.12" | "2.7" | "2.6"
+            local SERIES="$2"       # for naming zip (except 2.6 special)
+            local ZIP_NAME="python-docs-${SLUG}-en.zip"
+            local OUT_PATH="${OUT_DIR}/${ZIP_NAME}"
+
+            local REF=""
+            local SHA=""
+            local URL=""
+
+            if [ "$SLUG" = "2.7" ]; then
+              local LATEST
+              LATEST="$(latest_patch_for_series 2.7)"
+              [ -z "$LATEST" ] && { echo "No 2.7 patch tag found." >&2; exit 1; }
+              URL="https://docs.python.org/2.7/archives/python-${LATEST}-docs-html.zip"
+              REF="v${LATEST}"
+              SHA="$(sha_for_tag "$LATEST")"
+
+            elif [ "$SLUG" = "2.6" ]; then
+              URL="https://www.python.org/ftp/python/doc/2.6/python-2.6-docs-html.zip"
+              # best-effort metadata
+              local LATEST
+              LATEST="$(latest_patch_for_series 2.6)"
+              REF="v${LATEST:-2.6}"
+              SHA="$( [ -n "${LATEST:-}" ] && sha_for_tag "$LATEST" || echo "" )"
+
+            elif [ "$SLUG" = "3" ]; then
+              # "3" uses stable series zip name (e.g. python-3.14-docs-html.zip)
+              URL="https://docs.python.org/3/archives/python-${SERIES}-docs-html.zip"
+              local LATEST
+              LATEST="$(latest_patch_for_series "$STABLE_3_SERIES")"
+              REF="v${LATEST}"
+              SHA="$(sha_for_tag "$LATEST")"
+
+            elif [ "$SLUG" = "dev" ]; then
+              # Try docs.python.org/dev first (more future-proof)
+              URL="https://docs.python.org/dev/archives/python-${SERIES}-docs-html.zip"
+              REF="main"
+              SHA="$(sha_for_branch main)"
+
+              if ! curl -fsI "https://docs.python.org/dev/" >/dev/null 2>&1; then
+                # fallback: inferred numeric dev docs location
+                URL="https://docs.python.org/${SERIES}/archives/python-${SERIES}-docs-html.zip"
+              fi
+
+            else
+              # numeric minor like 3.12
+              URL="https://docs.python.org/${SLUG}/archives/python-${SLUG}-docs-html.zip"
+              local LATEST
+              LATEST="$(latest_patch_for_series "$SLUG")"
+              REF="v${LATEST}"
+              SHA="$(sha_for_tag "$LATEST")"
+            fi
+
+            echo "=== $SLUG ===" >&2
+            echo "URL: $URL" >&2
+
+            download_to "$URL" "$OUT_PATH"
+
+            printf "%s %s %s\n" "$SLUG" "$REF" "$SHA"
+          }
+
+          # Download all numeric series zips (including 2.6/2.7)
+          while read -r S; do
+            [ -z "$S" ] && continue
+            download_docs_zip "$S" "$S" >> "$META"
+          done <<< "$SERIES"
+
+          # Add "3" alias
+          download_docs_zip "3" "$STABLE_3_SERIES" >> "$META"
+
+          # Add "dev" (use inferred series name for zip naming)
+          download_docs_zip "dev" "$INFERRED_DEV_SERIES" >> "$META"
+
+          echo "Meta lines:" >&2
+          cat "$META" >&2
+
+          OWNER="${GITHUB_REPOSITORY_OWNER}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          TAG="offline-docs"
+          GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          jq -n --arg generatedAt "$GENERATED_AT" --arg releaseTag "$TAG" '{
+            generatedAt: $generatedAt,
+            releaseTag: $releaseTag,
+            versions: []
+          }' > "$OUT_DIR/manifest.json"
+
+          awk '
+            $1=="dev" || $1=="3" || $1=="2.6" || $1=="2.7" || $1 ~ /^[0-9]+\.[0-9]+$/ {print $0}
+          ' "$META" | awk '!seen[$1]++' > "$OUT_DIR/meta.clean.txt"
+
+          awk '
+            $1=="dev" {print "9999.9999 " $0; next}
+            $1=="3"   {print "9998.9998 " $0; next}
+            {split($1,a,"."); printf("%04d.%04d %s\n", a[1], a[2], $0)}
+          ' "$OUT_DIR/meta.clean.txt" | sort -r | while read -r KEY SLUG REF SHA; do
+            ASSET="python-docs-${SLUG}-en.zip"
+            ZIPURL="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/${ASSET}"
+
+            if [ "$SLUG" = "dev" ]; then
+              PAGE="https://docs.python.org/dev/"
+            elif [ "$SLUG" = "3" ]; then
+              PAGE="https://docs.python.org/3/"
+            elif [ "$SLUG" = "2.6" ]; then
+              PAGE="https://docs.python.org/release/2.6/"
+            else
+              PAGE="https://docs.python.org/${SLUG}/"
+            fi
+
+            jq \
+              --arg slug "$SLUG" \
+              --arg ref "$REF" \
+              --arg sha "$SHA" \
+              --arg zipUrl "$ZIPURL" \
+              --arg pageUrl "$PAGE" \
+              '.versions += [{slug:$slug, pageUrl:$pageUrl, zipUrl:$zipUrl, sha:$sha, ref:$ref}]' \
+              "$OUT_DIR/manifest.json" > "$OUT_DIR/manifest.tmp.json"
+
+            mv "$OUT_DIR/manifest.tmp.json" "$OUT_DIR/manifest.json"
+          done
+
+          MANIFEST_URL="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/manifest.json"
+          jq --arg manifestUrl "$MANIFEST_URL" '.manifestUrl=$manifestUrl' \
+            "$OUT_DIR/manifest.json" > "$OUT_DIR/manifest.tmp.json" && mv "$OUT_DIR/manifest.tmp.json" "$OUT_DIR/manifest.json"
+
+          echo "Manifest final:" >&2
+          cat "$OUT_DIR/manifest.json" >&2
+
+      - name: Publish/Update Release assets (offline-docs)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: offline-docs
+          name: Offline Docs
+          draft: false
+          prerelease: false
+          files: |
+            out/*.zip
+            out/manifest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,12 @@
+{
+  "name": "PythonDocs",
+  "displayName": "PythonDocs",
+  "react-native-google-mobile-ads": {
+    "android_app_id": "ca-app-pub-1648050772922935~1899279645"
+  },
+  "extra": {
+    "eas": {
+      "projectId": "c4468bfb-e9ec-40dc-bd41-3975801e22b5"
+    }
+  }
+}
