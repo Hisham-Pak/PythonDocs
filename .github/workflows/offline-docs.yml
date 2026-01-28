@@ -3,13 +3,13 @@ name: Build Offline Python Docs
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 3 * * *" # daily
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # required to create/update the release
 
     steps:
       - name: Install system deps
@@ -37,20 +37,23 @@ jobs:
             | awk '{print $2}' \
             | sed 's#refs/tags/##' \
             | sed 's#\^{}##' \
-            | grep -E '^v(2\.6|2\.7|3\.)[0-9]+\.[0-9]+$' \
+            | grep -E '^v3\.[0-9]+\.[0-9]+$' \
             | sed 's/^v//' \
             | sort -V)
 
-          # Unique series X.Y, filter >= 2.6
+          # Unique series X.Y, filter >= 3.0 (then we will add 2.6/2.7 explicitly)
           SERIES=$(echo "$TAGS" \
             | awk -F. '{print $1"."$2}' \
             | sort -Vu \
             | awk -F. '($1>2)||($1==2&&$2>=6){print $0}')
 
+          # Force include 2.6 and 2.7 (you said you need these)
+          SERIES=$(printf "2.6\n2.7\n%s\n" "$SERIES" | awk '!seen[$0]++')
+
           echo "Series to process (>=2.6):" >&2
           echo "$SERIES" >&2
 
-          # Stable Python 3 series = max 3.Y in SERIES
+          # Stable Python 3 series detected from SERIES
           STABLE_3_SERIES="$(echo "$SERIES" | awk -F. '$1==3{print $0}' | tail -n 1)"
           if [ -z "${STABLE_3_SERIES:-}" ]; then
             echo "No Python 3 series found; aborting." >&2
@@ -67,6 +70,7 @@ jobs:
           META="$OUT_DIR/meta.txt"
           : > "$META"
 
+          # Get commit SHA for a tag (works for annotated/lightweight tags)
           sha_for_tag () {
             local TAG_NO_V="$1"
             local TAG="v${TAG_NO_V}"
@@ -88,113 +92,181 @@ jobs:
             echo "$TAGS" | grep -E "^${SERIES}\.[0-9]+$" | tail -n 1 || true
           }
 
-          download_to () {
-            local URL="$1"
-            local OUT="$2"
-            echo "Downloading: $URL" >&2
-            curl -fL "$URL" -o "$OUT"
+          # Pull the official HTML zip URL from the docs "download.html" page for a slug
+          # Prints URL to stdout, or empty if not found.
+          find_html_zip_url () {
+            local SLUG="$1"
+
+            local PAGE=""
+            if [ "$SLUG" = "2.6" ]; then
+              PAGE="https://docs.python.org/release/2.6/download.html"
+            else
+              PAGE="https://docs.python.org/${SLUG}/download.html"
+            fi
+
+            # download page html (follow redirects)
+            local HTML
+            HTML="$(curl -fsL "$PAGE" || true)"
+            if [ -z "${HTML:-}" ]; then
+              echo ""
+              return
+            fi
+
+            # Try to find an absolute URL first
+            local URL
+            URL="$(printf "%s" "$HTML" | grep -oE 'https?://[^"]+docs-html\.zip' | head -n 1 || true)"
+            if [ -n "${URL:-}" ]; then
+              echo "$URL"
+              return
+            fi
+
+            # Try relative href like "archives/python-3.4-docs-html.zip"
+            local REL
+            REL="$(printf "%s" "$HTML" | grep -oE 'href="[^"]*docs-html\.zip"' | head -n 1 | sed -E 's/^href="|"$//g' || true)"
+            if [ -z "${REL:-}" ]; then
+              echo ""
+              return
+            fi
+
+            # Make absolute
+            if [[ "$REL" =~ ^https?:// ]]; then
+              echo "$REL"
+              return
+            fi
+
+            # Relative to page directory
+            if [ "$SLUG" = "2.6" ]; then
+              echo "https://docs.python.org/release/2.6/${REL#./}"
+            else
+              echo "https://docs.python.org/${SLUG}/${REL#./}"
+            fi
           }
 
+          # Download and re-zip into your consistent asset name: python-docs-<slug>-en.zip
+          # Writes ONE meta line: "<slug> <ref> <sha>" to stdout on success, nothing on skip.
           download_docs_zip () {
-            local SLUG="$1"         # "dev" | "3" | "3.12" | "2.7" | "2.6"
-            local SERIES="$2"       # for naming zip (except 2.6 special)
+            local SLUG="$1" # "dev", "3", "3.12", "2.7", "2.6"
             local ZIP_NAME="python-docs-${SLUG}-en.zip"
             local OUT_PATH="${OUT_DIR}/${ZIP_NAME}"
 
+            # Map "3" => download page at /3/download.html
+            local DOC_SLUG="$SLUG"
+            if [ "$SLUG" = "dev" ]; then
+              DOC_SLUG="dev"
+            elif [ "$SLUG" = "3" ]; then
+              DOC_SLUG="3"
+            fi
+
+            local URL
+            URL="$(find_html_zip_url "$DOC_SLUG")"
+            if [ -z "${URL:-}" ]; then
+              echo "Skipping $SLUG: could not find docs-html.zip URL" >&2
+              return 0
+            fi
+
+            echo "=== $SLUG ===" >&2
+            echo "URL: $URL" >&2
+
+            # download to temp
+            local TMP_ZIP="${OUT_DIR}/tmp-${SLUG}.zip"
+            if ! curl -fL "$URL" -o "$TMP_ZIP"; then
+              echo "Skipping $SLUG: download failed" >&2
+              rm -f "$TMP_ZIP" || true
+              return 0
+            fi
+
+            # Normalize: re-zip contents into python-docs-<slug>-en.zip
+            rm -rf "${OUT_DIR}/tmp-${SLUG}"
+            mkdir -p "${OUT_DIR}/tmp-${SLUG}"
+            unzip -q "$TMP_ZIP" -d "${OUT_DIR}/tmp-${SLUG}"
+
+            # Many python doc zips contain a top-level dir; zip the contents of the extracted tree
+            # Prefer the first directory if present
+            local ROOT="${OUT_DIR}/tmp-${SLUG}"
+            local FIRST_DIR
+            FIRST_DIR="$(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)"
+            if [ -n "${FIRST_DIR:-}" ]; then
+              ROOT="$FIRST_DIR"
+            fi
+
+            (cd "$ROOT" && zip -qr "../../../${OUT_PATH}" .) >&2
+
+            rm -f "$TMP_ZIP" || true
+            rm -rf "${OUT_DIR}/tmp-${SLUG}" || true
+
             local REF=""
             local SHA=""
-            local URL=""
 
-            if [ "$SLUG" = "2.7" ]; then
-              local LATEST
-              LATEST="$(latest_patch_for_series 2.7)"
-              [ -z "$LATEST" ] && { echo "No 2.7 patch tag found." >&2; exit 1; }
-              URL="https://docs.python.org/2.7/archives/python-${LATEST}-docs-html.zip"
-              REF="v${LATEST}"
-              SHA="$(sha_for_tag "$LATEST")"
-
-            elif [ "$SLUG" = "2.6" ]; then
-              URL="https://www.python.org/ftp/python/doc/2.6/python-2.6-docs-html.zip"
-              # best-effort metadata
-              local LATEST
-              LATEST="$(latest_patch_for_series 2.6)"
-              REF="v${LATEST:-2.6}"
-              SHA="$( [ -n "${LATEST:-}" ] && sha_for_tag "$LATEST" || echo "" )"
-
+            if [ "$SLUG" = "dev" ]; then
+              REF="main"
+              SHA="$(sha_for_branch main)"
             elif [ "$SLUG" = "3" ]; then
-              # "3" uses stable series zip name (e.g. python-3.14-docs-html.zip)
-              URL="https://docs.python.org/3/archives/python-${SERIES}-docs-html.zip"
               local LATEST
               LATEST="$(latest_patch_for_series "$STABLE_3_SERIES")"
               REF="v${LATEST}"
               SHA="$(sha_for_tag "$LATEST")"
-
-            elif [ "$SLUG" = "dev" ]; then
-              # Try docs.python.org/dev first (more future-proof)
-              URL="https://docs.python.org/dev/archives/python-${SERIES}-docs-html.zip"
-              REF="main"
-              SHA="$(sha_for_branch main)"
-
-              if ! curl -fsI "https://docs.python.org/dev/" >/dev/null 2>&1; then
-                # fallback: inferred numeric dev docs location
-                URL="https://docs.python.org/${SERIES}/archives/python-${SERIES}-docs-html.zip"
-              fi
-
+            elif [ "$SLUG" = "2.7" ]; then
+              # best-effort: cpython tags list may not include 2.7 in this repo/tag set
+              REF="v2.7"
+              SHA=""
+            elif [ "$SLUG" = "2.6" ]; then
+              REF="v2.6"
+              SHA=""
             else
-              # numeric minor like 3.12
-              URL="https://docs.python.org/${SLUG}/archives/python-${SLUG}-docs-html.zip"
               local LATEST
               LATEST="$(latest_patch_for_series "$SLUG")"
               REF="v${LATEST}"
               SHA="$(sha_for_tag "$LATEST")"
             fi
 
-            echo "=== $SLUG ===" >&2
-            echo "URL: $URL" >&2
-
-            download_to "$URL" "$OUT_PATH"
-
             printf "%s %s %s\n" "$SLUG" "$REF" "$SHA"
           }
 
-          # Download all numeric series zips (including 2.6/2.7)
+          # Process each numeric series (skip gracefully if no zip)
           while read -r S; do
             [ -z "$S" ] && continue
-            download_docs_zip "$S" "$S" >> "$META"
+            download_docs_zip "$S" >> "$META"
           done <<< "$SERIES"
 
           # Add "3" alias
-          download_docs_zip "3" "$STABLE_3_SERIES" >> "$META"
+          download_docs_zip "3" >> "$META"
 
-          # Add "dev" (use inferred series name for zip naming)
-          download_docs_zip "dev" "$INFERRED_DEV_SERIES" >> "$META"
+          # Add "dev" (use docs.python.org/dev/)
+          download_docs_zip "dev" >> "$META"
 
           echo "Meta lines:" >&2
           cat "$META" >&2
 
+          # ---------- Generate manifest.json ----------
           OWNER="${GITHUB_REPOSITORY_OWNER}"
           REPO="${GITHUB_REPOSITORY#*/}"
           TAG="offline-docs"
           GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          jq -n --arg generatedAt "$GENERATED_AT" --arg releaseTag "$TAG" '{
-            generatedAt: $generatedAt,
-            releaseTag: $releaseTag,
-            versions: []
-          }' > "$OUT_DIR/manifest.json"
+          jq -n \
+            --arg generatedAt "$GENERATED_AT" \
+            --arg releaseTag "$TAG" \
+            '{
+              generatedAt: $generatedAt,
+              releaseTag: $releaseTag,
+              versions: []
+            }' > "$OUT_DIR/manifest.json"
 
+          # Filter ONLY valid slugs: dev, 3, 2.6, 2.7, or X.Y
           awk '
             $1=="dev" || $1=="3" || $1=="2.6" || $1=="2.7" || $1 ~ /^[0-9]+\.[0-9]+$/ {print $0}
           ' "$META" | awk '!seen[$1]++' > "$OUT_DIR/meta.clean.txt"
 
+          # Sort: dev first, then 3, then numeric desc
           awk '
             $1=="dev" {print "9999.9999 " $0; next}
             $1=="3"   {print "9998.9998 " $0; next}
             {split($1,a,"."); printf("%04d.%04d %s\n", a[1], a[2], $0)}
           ' "$OUT_DIR/meta.clean.txt" | sort -r | while read -r KEY SLUG REF SHA; do
             ASSET="python-docs-${SLUG}-en.zip"
-            ZIPURL="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/${ASSET}"
+            URL="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/${ASSET}"
 
+            # pageUrl mapping
             if [ "$SLUG" = "dev" ]; then
               PAGE="https://docs.python.org/dev/"
             elif [ "$SLUG" = "3" ]; then
@@ -209,7 +281,7 @@ jobs:
               --arg slug "$SLUG" \
               --arg ref "$REF" \
               --arg sha "$SHA" \
-              --arg zipUrl "$ZIPURL" \
+              --arg zipUrl "$URL" \
               --arg pageUrl "$PAGE" \
               '.versions += [{slug:$slug, pageUrl:$pageUrl, zipUrl:$zipUrl, sha:$sha, ref:$ref}]' \
               "$OUT_DIR/manifest.json" > "$OUT_DIR/manifest.tmp.json"
