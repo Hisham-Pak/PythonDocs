@@ -11,10 +11,9 @@ const STORAGE_KEYS = {
 
 const COOLDOWN_MS = 3 * 60 * 1000; // 3 minutes
 
-// ✅ Use test ads in dev to avoid account issues
 const INTERSTITIAL_UNIT_ID = __DEV__
   ? TestIds.INTERSTITIAL
-  : "ca-app-pub-1648050772922935/1109776303";
+  : "ca-app-pub-1648050772922935/5006024750";
 
 let initialized = false;
 let interstitial: InterstitialAd | null = null;
